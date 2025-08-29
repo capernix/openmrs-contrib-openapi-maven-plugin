@@ -42,6 +42,7 @@ public class ResponseSchemaValidationTest {
     private static final AtomicInteger totalValidations = new AtomicInteger(0);
     private static final AtomicInteger successfulValidations = new AtomicInteger(0);
     private static final AtomicInteger failedValidations = new AtomicInteger(0);
+    private static final AtomicInteger skippedValidations = new AtomicInteger(0);
     private static final AtomicInteger endpointsTested = new AtomicInteger(0);
     private static final List<ValidationResult> validationResults = Collections.synchronizedList(new ArrayList<>());
     private static final Map<String, AtomicInteger> representationCounts = new ConcurrentHashMap<>();
@@ -64,6 +65,17 @@ public class ResponseSchemaValidationTest {
         "/fieldtype",
         "/drug"
     );
+
+    // Helper methods for consistent counting
+    private static String repBucket(String rep) {
+        if (rep == null || rep.isEmpty()) return "(none)";
+        if (rep.startsWith("custom:")) return "custom";
+        return rep;
+    }
+
+    private static void incRepAttempt(String rep) {
+        representationCounts.computeIfAbsent(repBucket(rep), k -> new AtomicInteger(0)).incrementAndGet();
+    }
 
     @BeforeAll
     static void initializeSchemaValidationTests() throws Exception {
@@ -210,11 +222,16 @@ public class ResponseSchemaValidationTest {
         System.out.println("   Total Validations: " + totalValidations.get());
         System.out.println("   Successful Validations: " + successfulValidations.get());
         System.out.println("   Failed Validations: " + failedValidations.get());
+        System.out.println("   Skipped Validations: " + skippedValidations.get());
+        System.out.println("   Total Counted (pass+fail+skipped): " + (successfulValidations.get() + failedValidations.get() + skippedValidations.get()));
         
         if (totalValidations.get() > 0) {
             double successRate = (successfulValidations.get() * 100.0) / totalValidations.get();
             System.out.println("   Success Rate: " + String.format("%.1f%%", successRate));
         }
+
+        System.out.println("\nBy representation (attempts):");
+        representationCounts.forEach((rep, cnt) -> System.out.println("   " + rep + ": " + cnt.get()));
         
         // Write failed validations to file instead of printing to console
         List<ValidationResult> failures = validationResults.stream()
@@ -268,8 +285,9 @@ public class ResponseSchemaValidationTest {
     private void validateEndpointWithRepresentation(String endpoint, String representation) {
         try {
             System.out.println("Validating: " + endpoint + " with representation: " + representation);
+            // Count one attempt here, since this method both fetches and validates
             totalValidations.incrementAndGet();
-            representationCounts.computeIfAbsent(representation, k -> new AtomicInteger(0)).incrementAndGet();
+            incRepAttempt(representation);
             
             // Fetch response from endpoint with timeout protection
             Response response;
@@ -403,7 +421,7 @@ public class ResponseSchemaValidationTest {
                                 recordValidationResult(endpoint, representation, true, 
                                     "Skipped due to $ref resolution: " + errorMsg, 
                                     Collections.singletonList("$ref resolution skipped"), null);
-                                successfulValidations.incrementAndGet();
+                                // Note: Don't increment successfulValidations here - let caller handle counting
                                 System.out.println("   Using schema: " + schemaName + " (validation skipped due to $ref issues)");
                                 return null; // Return null to indicate we handled this case
                             } catch (Exception skipError) {
@@ -788,19 +806,18 @@ public class ResponseSchemaValidationTest {
      * Validate endpoint against a specific schema with collection/item detection
      */
     private void validateEndpointAgainstSchema(String endpoint, String representation, String schemaName) {
-        totalValidations.incrementAndGet();
-        
         try {
-            // Make the API call - handle 'ref' representation specially
+            // Count one attempt per call
+            totalValidations.incrementAndGet();
+            incRepAttempt(representation);
+
             String url;
             if ("ref".equals(representation)) {
-                // For 'ref' representation, hit endpoint WITHOUT ?v= parameter
                 url = endpoint;
             } else {
-                // For other representations, use ?v= parameter
                 url = endpoint + "?v=" + representation + "&limit=1";
             }
-            
+
             Response response = given()
                 .header("Authorization", BASIC_AUTH)
                 .config(RestAssuredConfig.config()
@@ -812,59 +829,57 @@ public class ResponseSchemaValidationTest {
                 .then()
                 .extract()
                 .response();
-            
+
             if (response.getStatusCode() != 200) {
                 failedValidations.incrementAndGet();
                 String errorMsg = "HTTP " + response.getStatusCode() + ": " + response.getStatusLine();
-                recordValidationResult(endpoint, representation, false, errorMsg, 
+                recordValidationResult(endpoint, representation, false, errorMsg,
                     Collections.singletonList("Non-200 response"), response.getBody().asString());
                 return;
             }
-            
-            // Parse response
+
             JsonNode responseJson = objectMapper.readTree(response.getBody().asString());
-            
-            // Detect if this is a collection response or item response
             boolean isCollectionResponse = isCollectionResponse(responseJson);
-            
-            // Get base item schema
+
             JsonNode itemSchemaNode = openApiSpec.path("components").path("schemas").path(schemaName);
             if (itemSchemaNode.isMissingNode()) {
                 failedValidations.incrementAndGet();
-                String errorMsg = "Schema not found: " + schemaName;
-                recordValidationResult(endpoint, representation, false, errorMsg, 
-                    Collections.singletonList("Missing schema"), response.getBody().asString());
+                recordValidationResult(endpoint, representation, false,
+                    "Schema not found: " + schemaName,
+                    Collections.singletonList("Missing schema"),
+                    response.getBody().asString());
                 return;
             }
-            
-            // Build appropriate schema for validation
-            JsonNode schemaToValidate = isCollectionResponse ? 
-                buildCollectionWrapperSchema(itemSchemaNode) : itemSchemaNode;
-            
-            // Validate
+
+            JsonNode schemaToValidate = isCollectionResponse
+                ? buildCollectionWrapperSchemaWithContext(itemSchemaNode, schemaName)
+                : buildSchemaWithContext(schemaName);
+
+            if (schemaToValidate == null) {
+                // Treat as skipped (no data or cannot reasonably validate)
+                skippedValidations.incrementAndGet();
+                recordValidationResult(endpoint, representation, true,
+                    "Skipped due to schema context issue", Collections.singletonList("SKIPPED"), response.getBody().asString());
+                return;
+            }
+
             JsonSchema schema = schemaFactory.getSchema(schemaToValidate);
             Set<ValidationMessage> validationMessages = schema.validate(responseJson);
-            
+
             if (validationMessages.isEmpty()) {
                 successfulValidations.incrementAndGet();
-                recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), 
-                    response.getBody().asString());
-                representationCounts.computeIfAbsent(representation, k -> new AtomicInteger(0)).incrementAndGet();
+                recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), response.getBody().asString());
             } else {
                 failedValidations.incrementAndGet();
-                List<String> errors = validationMessages.stream()
-                    .map(ValidationMessage::getMessage)
-                    .collect(Collectors.toList());
-                String errorMsg = "Schema validation failed (" + (isCollectionResponse ? "collection" : "item") + "): " + String.join(", ", errors);
-                recordValidationResult(endpoint, representation, false, errorMsg, errors, 
-                    response.getBody().asString());
+                List<String> errors = validationMessages.stream().map(ValidationMessage::getMessage).collect(Collectors.toList());
+                recordValidationResult(endpoint, representation, false,
+                    "Schema validation failed (" + (isCollectionResponse ? "collection" : "item") + ")",
+                    errors, response.getBody().asString());
             }
-            
         } catch (Exception e) {
             failedValidations.incrementAndGet();
-            String errorMsg = "Exception: " + e.getMessage();
-            recordValidationResult(endpoint, representation, false, errorMsg, 
-                Collections.singletonList("Execution exception"), "");
+            recordValidationResult(endpoint, representation, false,
+                "Exception: " + e.getMessage(), Collections.singletonList("Execution exception"), "");
         }
     }
 
@@ -880,7 +895,23 @@ public class ResponseSchemaValidationTest {
      * Build a collection wrapper schema around an item schema
      * Creates: { type: "object", properties: { results: { type: "array", items: itemSchema } }, additionalProperties: true }
      */
-    private JsonNode buildCollectionWrapperSchema(JsonNode itemSchema) {
+    /**
+     * Build a schema with full OpenAPI context for $ref resolution
+     */
+    private JsonNode buildSchemaWithContext(String schemaName) {
+        ObjectNode fullSchema = objectMapper.createObjectNode();
+        fullSchema.put("$ref", "#/components/schemas/" + schemaName);
+        
+        // Add the components section for reference resolution
+        fullSchema.set("components", openApiSpec.path("components"));
+        
+        return fullSchema;
+    }
+    
+    /**
+     * Build a collection wrapper schema with full OpenAPI context for $ref resolution
+     */
+    private JsonNode buildCollectionWrapperSchemaWithContext(JsonNode itemSchema, String schemaName) {
         ObjectNode wrapperSchema = objectMapper.createObjectNode();
         wrapperSchema.put("type", "object");
         
@@ -889,10 +920,15 @@ public class ResponseSchemaValidationTest {
         // results property contains array of items
         ObjectNode resultsProperty = properties.putObject("results");
         resultsProperty.put("type", "array");
-        resultsProperty.set("items", itemSchema);
+        ObjectNode itemsRef = objectMapper.createObjectNode();
+        itemsRef.put("$ref", "#/components/schemas/" + schemaName);
+        resultsProperty.set("items", itemsRef);
         
         // Allow additional properties like "links", "resourceVersion", etc.
         wrapperSchema.put("additionalProperties", true);
+        
+        // Add the components section for reference resolution
+        wrapperSchema.set("components", openApiSpec.path("components"));
         
         return wrapperSchema;
     }
@@ -935,7 +971,7 @@ public class ResponseSchemaValidationTest {
             return;
         }
         
-        System.out.println("🔍 Testing " + propertyNames.size() + " custom properties for " + endpoint + ": " + propertyNames);
+        System.out.println(" Testing " + propertyNames.size() + " custom properties for " + endpoint + ": " + propertyNames);
         
         // Test each property individually with custom:(property)
         for (int i = 0; i < propertyNames.size(); i++) {
@@ -952,8 +988,6 @@ public class ResponseSchemaValidationTest {
      * REAL validation for custom property representations - checks if property actually exists
      */
     private void validateEndpointAccessibility(String endpoint, String representation) {
-        totalValidations.incrementAndGet();
-        
         try {
             Response response = given()
                 .header("Authorization", BASIC_AUTH)
@@ -967,66 +1001,77 @@ public class ResponseSchemaValidationTest {
                 .extract()
                 .response();
             
-            if (response.getStatusCode() != 200) {
+            int sc = response.getStatusCode();
+            if (sc != 200) {
+                totalValidations.incrementAndGet();
+                incRepAttempt(representation);
                 failedValidations.incrementAndGet();
-                String errorMsg = "HTTP " + response.getStatusCode() + ": " + response.getStatusLine();
-                recordValidationResult(endpoint, representation, false, errorMsg, 
+                recordValidationResult(endpoint, representation, false, 
+                    "HTTP " + sc + ": " + response.getStatusLine(),
                     Collections.singletonList("Non-200 response"), response.getBody().asString());
                 return;
             }
-            
+
             // NOW DO REAL VALIDATION - Check if the custom property actually exists
             if (representation.startsWith("custom:(") && representation.endsWith(")")) {
                 String propertyName = representation.substring("custom:(".length(), representation.length() - 1);
                 
                 JsonNode responseJson = objectMapper.readTree(response.getBody().asString());
-                boolean propertyExists = false;
-                String validationError = "";
-                
-                // Check if response is collection or item
+
                 if (responseJson.has("results") && responseJson.get("results").isArray()) {
-                    // Collection response - check in first result item
                     JsonNode results = responseJson.get("results");
-                    if (results.size() > 0) {
-                        JsonNode firstItem = results.get(0);
-                        propertyExists = firstItem.has(propertyName);
-                        if (!propertyExists) {
-                            validationError = "Property '" + propertyName + "' NOT found in collection results[0]. Available properties: " + 
-                                getAvailableProperties(firstItem);
-                        }
+                    if (results.size() == 0) {
+                        // skip
+                        skippedValidations.incrementAndGet();
+                        recordValidationResult(endpoint, representation, true,
+                            "Skipped property check: empty collection", Collections.singletonList("SKIPPED"), response.getBody().asString());
+                        return;
+                    }
+                    // We have data: count an attempt now
+                    totalValidations.incrementAndGet();
+                    incRepAttempt(representation);
+                    JsonNode firstItem = results.get(0);
+                    boolean propertyExists = firstItem.has(propertyName);
+                    if (propertyExists) {
+                        successfulValidations.incrementAndGet();
+                        recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), 
+                            response.getBody().asString());
                     } else {
-                        // Empty collection is OK - consider it successful since the API call worked
-                        propertyExists = true;
-                        System.out.println("Empty collection - cannot validate property existence, but API call succeeded");
+                        failedValidations.incrementAndGet();
+                        String validationError = "Property '" + propertyName + "' NOT found in collection results[0]. Available properties: " + 
+                            getAvailableProperties(firstItem);
+                        recordValidationResult(endpoint, representation, false, "REAL VALIDATION FAILED: " + validationError, 
+                            Collections.singletonList("Property not found"), response.getBody().asString());
                     }
                 } else {
-                    // Item response - check at root level
-                    propertyExists = responseJson.has(propertyName);
-                    if (!propertyExists) {
-                        validationError = "Property '" + propertyName + "' NOT found in item response. Available properties: " + 
+                    // Single item: count attempt now
+                    totalValidations.incrementAndGet();
+                    incRepAttempt(representation);
+                    boolean propertyExists = responseJson.has(propertyName);
+                    if (propertyExists) {
+                        successfulValidations.incrementAndGet();
+                        recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), 
+                            response.getBody().asString());
+                    } else {
+                        failedValidations.incrementAndGet();
+                        String validationError = "Property '" + propertyName + "' NOT found in item response. Available properties: " + 
                             getAvailableProperties(responseJson);
+                        recordValidationResult(endpoint, representation, false, "REAL VALIDATION FAILED: " + validationError, 
+                            Collections.singletonList("Property not found"), response.getBody().asString());
                     }
-                }
-                
-                if (propertyExists) {
-                    successfulValidations.incrementAndGet();
-                    recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), 
-                        response.getBody().asString());
-                    representationCounts.computeIfAbsent(representation, k -> new AtomicInteger(0)).incrementAndGet();
-                } else {
-                    failedValidations.incrementAndGet();
-                    recordValidationResult(endpoint, representation, false, "REAL VALIDATION FAILED: " + validationError, 
-                        Collections.singletonList("Property not found"), response.getBody().asString());
                 }
             } else {
                 // Non-custom representation - just check HTTP success for now
+                totalValidations.incrementAndGet();
+                incRepAttempt(representation);
                 successfulValidations.incrementAndGet();
                 recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), 
                     response.getBody().asString());
-                representationCounts.computeIfAbsent(representation, k -> new AtomicInteger(0)).incrementAndGet();
             }
             
         } catch (Exception e) {
+            totalValidations.incrementAndGet();
+            incRepAttempt(representation);
             failedValidations.incrementAndGet();
             String errorMsg = "Exception: " + e.getMessage();
             recordValidationResult(endpoint, representation, false, errorMsg, 
