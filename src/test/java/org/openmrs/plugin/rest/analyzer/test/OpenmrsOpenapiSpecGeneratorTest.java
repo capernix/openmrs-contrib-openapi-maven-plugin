@@ -737,7 +737,6 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
     
     /**
      * Type mapping registries for robust type detection.
-     * Phase 1 Enhancement: Replace fragile .contains() logic with exact type matching.
      */
     private static final Set<String> STRING_TYPES = new HashSet<>(Arrays.asList(
         "string", "java.lang.string", "charsequence", "java.lang.charsequence"
@@ -774,7 +773,6 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
     private static final Map<String, String> TYPE_CATEGORY_MAPPING = new HashMap<>();
     
     static {
-        // Initialize type category mappings for better error reporting and debugging
         for (String type : STRING_TYPES) {
             TYPE_CATEGORY_MAPPING.put(type, "STRING");
         }
@@ -795,7 +793,6 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
         }
     }
 
-    // Phase 1 Enhancement: Made package-private for testing
     Schema<?> mapToSwaggerSchema(String javaType, Components components, String representationHint, boolean isArrayItem) {
         if (javaType == null) return new StringSchema();
         
@@ -808,7 +805,6 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
         String cleanType = SchemaNameGenerator.cleanTypeString(javaType);
         String normalizedType = normalizeTypeName(cleanType);
         
-        // Phase 1 Enhancement: Robust type detection using predefined registries
         if (STRING_TYPES.contains(normalizedType)) {
             log.debug("Mapped type '{}' -> StringSchema (category: STRING)", javaType);
             return new StringSchema();
@@ -844,7 +840,6 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
             log.debug("Mapped type '{}' -> ObjectSchema (runtime-determined)", javaType);
             return new ObjectSchema().description("Type determined from " + javaType);
         } else {
-            // Enhanced fallback with better error handling and type category reporting
             String typeCategory = TYPE_CATEGORY_MAPPING.get(normalizedType);
             if (typeCategory != null) {
                 log.warn("Type '{}' recognized as {} but fell through to fallback - possible mapping issue", javaType, typeCategory);
@@ -864,21 +859,17 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
         
         String normalized = typeName.toLowerCase().trim();
         
-        // Handle array notation: String[] -> string
         if (normalized.endsWith("[]")) {
             normalized = normalized.substring(0, normalized.length() - 2);
         }
         
-        // Handle generic parameters: List<String> is handled elsewhere, but clean simple cases
         int genericStart = normalized.indexOf('<');
         if (genericStart > 0) {
             normalized = normalized.substring(0, genericStart);
         }
         
-        // Remove common prefixes for cleaner matching
         if (normalized.startsWith("java.lang.")) {
             String withoutPrefix = normalized.substring("java.lang.".length());
-            // Only use shortened form for common types to avoid conflicts
             Set<String> commonTypes = new HashSet<>(Arrays.asList(
                 "string", "integer", "long", "double", "float", "boolean", "short", "byte"
             ));
@@ -891,20 +882,18 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
     }
     
     /**
-     * Phase 1 Enhancement: Creates a fallback schema for unknown types with enhanced diagnostics.
+     * Creates a fallback schema for unknown types with enhanced diagnostics.
      * Provides better error reporting and potential recovery strategies.
      */
     private Schema<?> createFallbackSchema(String originalType, String normalizedType) {
         ObjectSchema schema = new ObjectSchema();
         
-        // Provide detailed description for debugging
         StringBuilder description = new StringBuilder("Complex type: ").append(originalType);
         
         if (!originalType.equals(normalizedType)) {
             description.append(" (normalized: ").append(normalizedType).append(")");
         }
         
-        // Add hints for common issues
         if (normalizedType.contains("list") || normalizedType.contains("set") || normalizedType.contains("collection")) {
             description.append(" - Note: This appears to be a collection type but wasn't detected by isCollectionType()");
         } else if (normalizedType.contains(".")) {
@@ -915,7 +904,6 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
         
         schema.setDescription(description.toString());
         
-        // Add example to help with debugging
         schema.setExample("Value of type " + originalType);
         
         return schema;

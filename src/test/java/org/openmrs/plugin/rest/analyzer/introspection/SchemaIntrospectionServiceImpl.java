@@ -334,14 +334,12 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			
 			String getterName = "get" + Character.toUpperCase(propertyName.charAt(0)) + propertyName.substring(1);
 			try {
-				// Try parameterless getter first (most common case)
 				Method getter = resourceClass.getMethod(getterName);
 				if (getter != null) {
 					Type returnType = getter.getGenericReturnType();
 					return getTypeName(returnType);
 				}
 			} catch (NoSuchMethodException e) {
-				// Try getter with delegate type parameter (less common)
 				try {
 					Class<?> delegateType = getDelegateType((Resource) handler);
 					if (delegateType != null) {
@@ -503,14 +501,12 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 	private String inferTypeFromPropertyName(String propertyName, DelegatingResourceHandler<?> handler) {
 		if (propertyName == null) return "String";
 		
-		// STRATEGY 1: Use actual PropertyGetter annotation scanning first - highest accuracy
 		String annotationBasedType = resolveFromActualPropertyGetterAnnotations(propertyName, handler);
 		if (annotationBasedType != null) {
 			log.debug("Found type via PropertyGetter annotations for '{}': {}", propertyName, annotationBasedType);
 			return annotationBasedType;
 		}
 		
-		// STRATEGY 2: Safe pattern matching for universal OpenMRS properties only
 		String safePatternType = resolveSafePatterns(propertyName);
 		log.debug("Using safe pattern type for '{}': {}", propertyName, safePatternType);
 		return safePatternType;
@@ -529,10 +525,8 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			Class<?> resourceClass = handler.getClass();
 			Map<String, String> annotatedProperties = new HashMap<>();
 			
-			// Reuse the existing discoverAnnotatedProperties method
 			discoverAnnotatedProperties(resourceClass, annotatedProperties);
 			
-			// Check if our property was found
 			String resolvedType = annotatedProperties.get(propertyName);
 			if (resolvedType != null) {
 				log.debug("Found property '{}' with type '{}' via PropertyGetter annotation scanning", propertyName, resolvedType);
@@ -553,7 +547,6 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 	 * Removed List<Object> fallback and hardcoded collection patterns that prevent proper type discovery.
 	 */
 	private String resolveSafePatterns(String propertyName) {
-		// Safe individual property patterns - these are consistent across OpenMRS
 		if (propertyName.equals("id")) {
 			return "Integer";
 		} else if (propertyName.equals("uuid")) {
@@ -567,8 +560,6 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			return "Date";
 		}
 		
-		// No generic fallbacks - let PropertyGetter scanning or reflection handle collections
-		// Ultimate fallback only for truly unknown properties
 		return "String";
 	}
 }
